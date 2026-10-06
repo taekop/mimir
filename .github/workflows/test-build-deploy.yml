@@ -352,6 +352,15 @@ jobs:
         run: |
           echo "Running unit tests (group ${{ matrix.test_group_id }} of ${{ matrix.test_group_total }})${{ matrix.extra_build_tags != '' && format(' with build tags: {0}', matrix.extra_build_tags) || '' }} with Go version: $(go version)"
           EXTRA_BUILD_TAGS="${{ matrix.extra_build_tags }}" ./.github/workflows/scripts/run-unit-tests-group.sh --index ${{ matrix.test_group_id }} --total ${{ matrix.test_group_total }}
+      # Grafana builds Mimir with GOAMD64=v3, which enables the SIMD code in the usage-tracker.
+      # The tests above use the default GOAMD64=v1, so they never build that code.
+      - name: Run GOAMD64=v3 tests
+        if: matrix.test_group_id == 0 && matrix.extra_build_tags == ''
+        env:
+          GOAMD64: v3
+        run: |
+          go vet -tags=netgo,stringlabels ./pkg/usagetracker/tenantshard/...
+          go test -tags=netgo,stringlabels ./pkg/usagetracker/tenantshard/...
       - name: Record failed packages for notification
         if: failure() && env.FAILED_PACKAGES != ''
         run: |
