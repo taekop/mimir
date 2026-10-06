@@ -677,9 +677,13 @@ func TestCleanupGroup(t *testing.T) {
 	}
 
 	t.Run("one entry", func(t *testing.T) {
-		// Every value against every watermark, in every slot.
-		for watermark := clock.Minutes(0); watermark < 120; watermark++ {
-			for value := clock.Minutes(0); value < 120; value++ {
+		// Every value that Put accepts against every watermark byte, in every slot. This includes
+		// bytes that clock.ToMinutes never produces, so that the implementations match
+		// GreaterOrEqualThan for any input, not only for valid minutes.
+		for w := range 256 {
+			watermark := clock.Minutes(w)
+			for v := range 0xfe {
+				value := clock.Minutes(v)
 				for j := range groupSize {
 					var idx index
 					var d data
@@ -702,10 +706,10 @@ func TestCleanupGroup(t *testing.T) {
 				case p < 4:
 					idx[j], d[j] = spillmark, spillmark
 				default:
-					idx[j], d[j] = prefix(prefixOffset+r.Intn(128)), xor(clock.Minutes(r.Intn(120)))
+					idx[j], d[j] = prefix(prefixOffset+r.Intn(128)), xor(clock.Minutes(r.Intn(0xfe)))
 				}
 			}
-			check(t, idx, d, clock.Minutes(r.Intn(120)))
+			check(t, idx, d, clock.Minutes(r.Intn(256)))
 		}
 	})
 }

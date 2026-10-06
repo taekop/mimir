@@ -8,6 +8,14 @@ DATA ones<>+0(SB)/8, $0x0101010101010101
 DATA ones<>+8(SB)/8, $0x0101010101010101
 GLOBL ones<>(SB), RODATA|NOPTR, $16
 
+DATA cycle<>+0(SB)/8, $0x7878787878787878
+DATA cycle<>+8(SB)/8, $0x7878787878787878
+GLOBL cycle<>(SB), RODATA|NOPTR, $16
+
+DATA maxAhead<>+0(SB)/8, $0x3b3b3b3b3b3b3b3b
+DATA maxAhead<>+8(SB)/8, $0x3b3b3b3b3b3b3b3b
+GLOBL maxAhead<>(SB), RODATA|NOPTR, $16
+
 DATA marks<>+0(SB)/8, $0x0000000000000000
 DATA marks<>+8(SB)/8, $0x0100000000000000
 GLOBL marks<>(SB), RODATA|NOPTR, $16
@@ -33,18 +41,31 @@ TEXT ·matchEmptyOrSpillmarkAVX2(SB), NOSPLIT, $0-10
 	MOVW      AX, ret+8(FP)
 	RET
 
-// func cleanupGroupAVX2(idx *[16]uint8, d *[16]uint8, lo uint8, length uint8) int
+// func cleanupGroupAVX2(idx *[16]uint8, d *[16]uint8, watermark uint8) int
 // Requires: AVX, AVX2, POPCNT
 TEXT ·cleanupGroupAVX2(SB), NOSPLIT, $0-32
 	MOVQ    d+8(FP), AX
 	VMOVDQU (AX), X0
 
-	// Lanes in the expired range: min(x-lo, length) == x-lo.
-	VPBROADCASTB lo+16(FP), X1
-	VPBROADCASTB length+17(FP), X2
-	VPSUBB       X1, X0, X1
-	VPMINUB      X2, X1, X2
-	VPCMPEQB     X1, X2, X2
+	// v = ^x turns the data back into clock.Minutes.
+	VPCMPEQB X0, X0, X1
+	VPXOR    X0, X1, X1
+
+	// d := watermark - v is negative when watermark < v, that is when max(watermark, v) != watermark.
+	VPBROADCASTB watermark+16(FP), X2
+	VPMAXUB      X1, X2, X3
+	VPCMPEQB     X2, X3, X3
+
+	// aheadOf = d + (d>>63)&120: add 120 to the lanes where d is negative.
+	// Go computes this in int64 and here it wraps at 256, but aheadOf is always in [-135, 255],
+	// and the wrap only moves [-135, -1] to [121, 255], which is not below 60 either.
+	VPSUBB X1, X2, X1
+	VPANDN cycle<>+0(SB), X3, X2
+	VPADDB X2, X1, X1
+
+	// aheadOf < 60, that is min(aheadOf, 59) == aheadOf.
+	VPMINUB  maxAhead<>+0(SB), X1, X2
+	VPCMPEQB X1, X2, X2
 
 	// Lanes that hold no data: min(x, 1) == x. Data and index always agree on which slots these are.
 	VPMINUB  ones<>+0(SB), X0, X1

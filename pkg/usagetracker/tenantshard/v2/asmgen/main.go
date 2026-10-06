@@ -18,10 +18,12 @@ func main() {
 	// GOAMD64=v3 guarantees AVX, AVX2 and POPCNT, so no runtime CPU feature check is needed.
 	ConstraintExpr("amd64.v3,!nosimd")
 
-	// ones holds 0x01 in every lane: a byte x is either empty (0) or a spillmark (1) when min(x, 1) == x.
-	ones := GLOBL("ones", RODATA|NOPTR)
-	DATA(0, U64(0x0101010101010101))
-	DATA(8, U64(0x0101010101010101))
+	// ones holds 1 in every lane: a byte x is either empty (0) or a spillmark (1) when min(x, 1) == x.
+	ones := splat("ones", 1)
+	// cycle and maxAhead are the constants of clock.Minutes.GreaterOrEqualThan: the 120 minutes of
+	// the clock face, and the largest aheadOf that is still below 60.
+	cycle := splat("cycle", 120)
+	maxAhead := splat("maxAhead", 59)
 
 	// marks is what Cleanup writes into a removed slot: empty (0) everywhere, except for a spillmark (1)
 	// in the last slot, which keeps the signal that the group may have spilled into the next one.
@@ -31,14 +33,22 @@ func main() {
 
 	match()
 	matchEmptyOrSpillmark(ones)
-	cleanupGroup(ones, marks)
+	cleanupGroup(ones, cycle, maxAhead, marks)
 
 	Generate()
 }
 
+// splat declares a 16 byte constant that holds b in every lane.
+func splat(name string, b uint8) Mem {
+	m := GLOBL(name, RODATA|NOPTR)
+	lanes := uint64(b) * 0x0101010101010101
+	DATA(0, U64(lanes))
+	DATA(8, U64(lanes))
+	return m
+}
+
 func match() {
 	TEXT("matchAVX2", NOSPLIT, "func(idx *[16]uint8, p uint8) uint16")
-	Doc("matchAVX2 returns a bitset with bit i set when idx[i] == p.")
 
 	idx := Mem{Base: Load(Param("idx"), GP64())}
 	x := XMM()
@@ -53,7 +63,6 @@ func match() {
 
 func matchEmptyOrSpillmark(ones Mem) {
 	TEXT("matchEmptyOrSpillmarkAVX2", NOSPLIT, "func(idx *[16]uint8) uint16")
-	Doc("matchEmptyOrSpillmarkAVX2 returns a bitset with bit i set when idx[i] is empty or a spillmark.")
 
 	x := XMM()
 	VMOVDQU(Mem{Base: Load(Param("idx"), GP64())}, x)
@@ -67,26 +76,38 @@ func matchEmptyOrSpillmark(ones Mem) {
 	RET()
 }
 
-func cleanupGroup(ones, marks Mem) {
-	TEXT("cleanupGroupAVX2", NOSPLIT, "func(idx *[16]uint8, d *[16]uint8, lo uint8, length uint8) int")
-	Doc(
-		"cleanupGroupAVX2 removes the slots of the group that hold data in the expired range, and returns how many it removed.",
-		"A data byte x is in the expired range when uint8(x-lo) <= length, see expiredRange.",
-		"Removed slots become empty in both idx and d, except for the last one, which becomes a spillmark.",
-	)
+func cleanupGroup(ones, cycle, maxAhead, marks Mem) {
+	TEXT("cleanupGroupAVX2", NOSPLIT, "func(idx *[16]uint8, d *[16]uint8, watermark uint8) int")
 
 	d := Mem{Base: Load(Param("d"), GP64())}
 	x := XMM()
 	VMOVDQU(d, x)
 
-	Comment("Lanes in the expired range: min(x-lo, length) == x-lo.")
-	lo, length := XMM(), XMM()
-	VPBROADCASTB(addr(Param("lo")), lo)
-	VPBROADCASTB(addr(Param("length")), length)
-	y, expired := XMM(), XMM()
-	VPSUBB(lo, x, y)
-	VPMINUB(length, y, expired)
-	VPCMPEQB(y, expired, expired)
+	Comment("v = ^x turns the data back into clock.Minutes.")
+	v := XMM()
+	VPCMPEQB(x, x, v)
+	VPXOR(x, v, v)
+
+	Comment("d := watermark - v is negative when watermark < v, that is when max(watermark, v) != watermark.")
+	w, ge := XMM(), XMM()
+	VPBROADCASTB(addr(Param("watermark")), w)
+	VPMAXUB(v, w, ge)
+	VPCMPEQB(w, ge, ge)
+
+	Comment(
+		"aheadOf = d + (d>>63)&120: add 120 to the lanes where d is negative.",
+		"Go computes this in int64 and here it wraps at 256, but aheadOf is always in [-135, 255],",
+		"and the wrap only moves [-135, -1] to [121, 255], which is not below 60 either.",
+	)
+	ahead, fix := XMM(), XMM()
+	VPSUBB(v, w, ahead)
+	VPANDN(cycle, ge, fix)
+	VPADDB(fix, ahead, ahead)
+
+	Comment("aheadOf < 60, that is min(aheadOf, 59) == aheadOf.")
+	expired := XMM()
+	VPMINUB(maxAhead, ahead, expired)
+	VPCMPEQB(ahead, expired, expired)
 
 	Comment("Lanes that hold no data: min(x, 1) == x. Data and index always agree on which slots these are.")
 	free := XMM()
